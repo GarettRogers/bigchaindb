@@ -1,7 +1,7 @@
 FROM rethinkdb:2.3
 
 RUN apt-get update
-RUN apt-get -y install python3 python3-pip
+RUN apt-get -y install python3 python3-pip libffi-dev
 RUN pip3 install --upgrade pip
 RUN pip3 install --upgrade setuptools
 
@@ -19,7 +19,7 @@ ENV BIGCHAINDB_CONFIG_PATH /data/.bigchaindb
 ENV BIGCHAINDB_SERVER_BIND 0.0.0.0:9984
 ENV BIGCHAINDB_API_ENDPOINT http://bigchaindb:9984/api/v1
 
-ENTRYPOINT ["bigchaindb", "--experimental-start-rethinkdb"]
+ENTRYPOINT ["bigchaindb", "--dev-start-rethinkdb", "--dev-allow-temp-keypair"]
 
 CMD ["start"]
 

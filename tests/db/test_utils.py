@@ -1,10 +1,10 @@
 import builtins
 
+from bigchaindb.common import exceptions
 import pytest
 import rethinkdb as r
 
 import bigchaindb
-from bigchaindb import util
 from bigchaindb.db import utils
 from .conftest import setup_database as _setup_database
 
@@ -79,7 +79,7 @@ def test_create_bigchain_secondary_index():
     assert r.db(dbname).table('bigchain').index_list().contains(
         'transaction_id').run(conn) is True
     assert r.db(dbname).table('bigchain').index_list().contains(
-        'payload_uuid').run(conn) is True
+        'metadata_id').run(conn) is True
 
 
 def test_create_backlog_table():
@@ -151,7 +151,7 @@ def test_init_fails_if_db_exists():
     # The db is set up by fixtures
     assert r.db_list().contains(dbname).run(conn) is True
 
-    with pytest.raises(bigchaindb.exceptions.DatabaseAlreadyExists):
+    with pytest.raises(exceptions.DatabaseAlreadyExists):
         utils.init()
 
 
@@ -201,6 +201,6 @@ def test_drop_non_existent_db_raises_an_error():
     assert r.db_list().contains(dbname).run(conn) is True
     utils.drop(assume_yes=True)
 
-    with pytest.raises(bigchaindb.exceptions.DatabaseDoesNotExist):
+    with pytest.raises(exceptions.DatabaseDoesNotExist):
         utils.drop(assume_yes=True)
 

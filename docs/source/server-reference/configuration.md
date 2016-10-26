@@ -1,8 +1,6 @@
-# BigchainDB Configuration Settings
+# Configuration Settings
 
-**Note: At the time of writing, BigchainDB Server code and BigchainDB Python driver code are mixed together, so the following settings are the settings used by BigchainDB Server and also by clients written using the Python driver code. Soon, the code will be separated into server, driver and shared modules, so that BigchainDB Server and BigchainDB clients will have different configuration settings.**
-
-The value of each configuration setting is determined according to the following rules:
+The value of each BigchainDB Server configuration setting is determined according to the following rules:
 
 * If it's set by an environment variable, then use that value
 * Otherwise, if it's set in a local config file, then use that value
@@ -20,7 +18,6 @@ For convenience, here's a list of all the relevant environment variables (docume
 `BIGCHAINDB_SERVER_WORKERS`<br>
 `BIGCHAINDB_SERVER_THREADS`<br>
 `BIGCHAINDB_API_ENDPOINT`<br>
-`BIGCHAINDB_CONSENSUS_PLUGIN`<br>
 `BIGCHAINDB_STATSD_HOST`<br>
 `BIGCHAINDB_STATSD_PORT`<br>
 `BIGCHAINDB_STATSD_RATE`<br>
@@ -160,21 +157,6 @@ export BIGCHAINDB_API_ENDPOINT="http://localhost:9984/api/v1"
 **Default value (from a config file)**
 ```js
 "api_endpoint": "http://localhost:9984/api/v1"
-```
-
-
-## consensus_plugin
-
-The [consensus plugin](../appendices/consensus.html) to use. 
-
-**Example using an environment variable**
-```text
-export BIGCHAINDB_CONSENSUS_PLUGIN=default
-```
-
-**Example config file snippet: the default**
-```js
-"consensus_plugin": "default"
 ```
 
 

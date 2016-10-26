@@ -88,15 +88,12 @@ setup(
         'console_scripts': [
             'bigchaindb=bigchaindb.commands.bigchain:main'
         ],
-        'bigchaindb.consensus': [
-            'default=bigchaindb.consensus:BaseConsensusRules'
-        ]
     },
     install_requires=[
         'rethinkdb~=2.3',
         'pysha3==0.3',
         'pytz==2015.7',
-        'cryptoconditions==0.4.1',
+        'cryptoconditions==0.5.0',
         'statsd==3.2.1',
         'python-rapidjson==0.0.6',
         'logstats==0.2.1',

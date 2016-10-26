@@ -3,23 +3,29 @@ for ``argparse.ArgumentParser``.
 """
 
 import argparse
+from bigchaindb.common.exceptions import StartupError
 import multiprocessing as mp
 import subprocess
 
 import rethinkdb as r
 
 import bigchaindb
-from bigchaindb.exceptions import StartupError
 from bigchaindb import db
 from bigchaindb.version import __version__
+
 
 
 def start_rethinkdb():
     """Start RethinkDB as a child process and wait for it to be
     available.
 
+    Args:
+        wait_for_db (bool): wait for the database to be ready
+        extra_opts (list): a list of extra options to be used when
+            starting the db
+
     Raises:
-        ``bigchaindb.exceptions.StartupError`` if RethinkDB cannot
+        ``bigchaindb.common.exceptions.StartupError`` if RethinkDB cannot
         be started.
     """
 
@@ -33,11 +39,11 @@ def start_rethinkdb():
 
     for line in proc.stdout:
         if line.startswith('Server ready'):
+
             # FIXME: seems like tables are not ready when the server is ready,
             #        that's why we need to query RethinkDB to know the state
             #        of the database. This code assumes the tables are ready
             #        when the database is ready. This seems a valid assumption.
-
             try:
                 conn = db.get_conn()
                 # Before checking if the db is ready, we need to query
@@ -47,7 +53,6 @@ def start_rethinkdb():
             except (r.ReqlOpFailedError, r.ReqlDriverError) as exc:
                 raise StartupError('Error waiting for the database `{}` '
                                    'to be ready'.format(dbname)) from exc
-
             return proc
 
     # We are here when we exhaust the stdout of the process.
@@ -55,7 +60,7 @@ def start_rethinkdb():
     raise StartupError(line)
 
 
-def start(parser, scope):
+def start(parser, argv, scope):
     """Utility function to execute a subcommand.
 
     The function will look up in the ``scope``
@@ -64,17 +69,18 @@ def start(parser, scope):
 
     Args:
         parser: an ArgumentParser instance.
+        argv: the list of command line arguments without the script name.
         scope (dict): map containing (eventually) the functions to be called.
 
     Raises:
         NotImplementedError: if ``scope`` doesn't contain a function called
                              ``run_<parser.args.command>``.
     """
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if not args.command:
         parser.print_help()
-        return
+        raise SystemExit()
 
     # look up in the current scope for a function called 'run_<command>'
     # replacing all the dashes '-' with the lowercase character '_'
@@ -92,7 +98,7 @@ def start(parser, scope):
     elif args.multiprocess is None:
         args.multiprocess = mp.cpu_count()
 
-    func(args)
+    return func(args)
 
 
 base_parser = argparse.ArgumentParser(add_help=False, prog='bigchaindb')

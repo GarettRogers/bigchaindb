@@ -1,13 +1,13 @@
-"""Utils to configure BigchainDB.
+"""Utils for reading and setting configuration settings.
 
-By calling `file_config`, the global configuration (stored in
-`$HOME/.bigchaindb`) will be updated with the values contained
-in the configuration file.
+The value of each BigchainDB Server configuration setting is
+determined according to the following rules:
 
-Note that there is a precedence in reading configuration values:
- - local config file;
- - environment vars;
- - default config file (contained in ``bigchaindb.__init__``).
+* If it's set by an environment variable, then use that value
+* Otherwise, if it's set in a local config file, then use that
+  value
+* Otherwise, use the default value (contained in 
+  ``bigchaindb.__init__``)
 """
 
 
@@ -16,13 +16,11 @@ import copy
 import json
 import logging
 import collections
-from functools import lru_cache
 
-from pkg_resources import iter_entry_points, ResolutionError
+from bigchaindb.common import exceptions
 
 import bigchaindb
-from bigchaindb.consensus import AbstractConsensusRules
-from bigchaindb import exceptions
+
 
 # TODO: move this to a proper configuration file for logging
 logging.getLogger('requests').setLevel(logging.WARNING)
@@ -242,40 +240,3 @@ def autoconfigure(filename=None, config=None, force=False):
         newconfig = update(newconfig, config)
 
     set_config(newconfig)  # sets bigchaindb.config
-
-
-@lru_cache()
-def load_consensus_plugin(name=None):
-    """Find and load the chosen consensus plugin.
-
-    Args:
-        name (string): the name of the entry_point, as advertised in the
-            setup.py of the providing package.
-
-    Returns:
-        an uninstantiated subclass of ``bigchaindb.consensus.AbstractConsensusRules``
-    """
-    if not name:
-        name = bigchaindb.config.get('consensus_plugin', 'default')
-
-    # TODO: This will return the first plugin with group `bigchaindb.consensus`
-    #       and name `name` in the active WorkingSet.
-    #       We should probably support Requirements specs in the config, e.g.
-    #       consensus_plugin: 'my-plugin-package==0.0.1;default'
-    plugin = None
-    for entry_point in iter_entry_points('bigchaindb.consensus', name):
-        plugin = entry_point.load()
-
-    # No matching entry_point found
-    if not plugin:
-        raise ResolutionError(
-            'No plugin found in group `bigchaindb.consensus` with name `{}`'.
-            format(name))
-
-    # Is this strictness desireable?
-    # It will probably reduce developer headaches in the wild.
-    if not issubclass(plugin, (AbstractConsensusRules)):
-        raise TypeError("object of type '{}' does not implement `bigchaindb."
-                        "consensus.AbstractConsensusRules`".format(type(plugin)))
-
-    return plugin

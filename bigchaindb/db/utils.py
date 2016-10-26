@@ -1,21 +1,78 @@
 """Utils to initialize and drop the database."""
 
+import time
 import logging
 
+from bigchaindb.common import exceptions
 import rethinkdb as r
 
 import bigchaindb
-from bigchaindb import exceptions
 
 
 logger = logging.getLogger(__name__)
 
 
+class Connection:
+    """This class is a proxy to run queries against the database,
+    it is:
+    - lazy, since it creates a connection only when needed
+    - resilient, because before raising exceptions it tries
+      more times to run the query or open a connection.
+    """
+
+    def __init__(self, host=None, port=None, db=None, max_tries=3):
+        """Create a new Connection instance.
+
+        Args:
+            host (str, optional): the host to connect to.
+            port (int, optional): the port to connect to.
+            db (str, optional): the database to use.
+            max_tries (int, optional): how many tries before giving up.
+        """
+
+        self.host = host or bigchaindb.config['database']['host']
+        self.port = port or bigchaindb.config['database']['port']
+        self.db = db or bigchaindb.config['database']['name']
+        self.max_tries = max_tries
+        self.conn = None
+
+    def run(self, query):
+        """Run a query.
+
+        Args:
+            query: the RethinkDB query.
+        """
+
+        if self.conn is None:
+            self._connect()
+
+        for i in range(self.max_tries):
+            try:
+                return query.run(self.conn)
+            except r.ReqlDriverError as exc:
+                if i + 1 == self.max_tries:
+                    raise
+                else:
+                    self._connect()
+
+    def _connect(self):
+        for i in range(self.max_tries):
+            try:
+                self.conn = r.connect(host=self.host, port=self.port,
+                                      db=self.db)
+            except r.ReqlDriverError as exc:
+                if i + 1 == self.max_tries:
+                    raise
+                else:
+                    time.sleep(2**i)
+
+
 def get_conn():
     '''Get the connection to the database.'''
 
-    return r.connect(bigchaindb.config['database']['host'],
-                     bigchaindb.config['database']['port'])
+    return r.connect(host=bigchaindb.config['database']['host'],
+                     port=bigchaindb.config['database']['port'],
+                     db=bigchaindb.config['database']['name'])
 
 
 def get_database_name():
@@ -49,9 +106,14 @@ def create_bigchain_secondary_index(conn, dbname):
         .run(conn)
     # secondary index for payload data by UUID
     r.db(dbname).table('bigchain')\
-        .index_create('payload_uuid',
-                      r.row['block']['transactions']['transaction']['data']['uuid'], multi=True)\
+        .index_create('metadata_id',
+                      r.row['block']['transactions']['transaction']['metadata']['id'], multi=True)\
         .run(conn)
+    # secondary index for asset uuid
+    r.db(dbname).table('bigchain')\
+                .index_create('asset_id',
+                              r.row['block']['transactions']['transaction']['asset']['id'], multi=True)\
+                .run(conn)
 
     # wait for rethinkdb to finish creating secondary indexes
     r.db(dbname).table('bigchain').index_wait().run(conn)

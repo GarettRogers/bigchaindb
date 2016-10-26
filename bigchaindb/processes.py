@@ -2,7 +2,7 @@ import logging
 import multiprocessing as mp
 
 import bigchaindb
-from bigchaindb.pipelines import vote, block, election
+from bigchaindb.pipelines import vote, block, election, stale
 from bigchaindb.web import server
 
 
@@ -11,9 +11,10 @@ logger = logging.getLogger(__name__)
 BANNER = """
 ****************************************************************************
 *                                                                          *
-*   Initialization complete. BigchainDB is ready and waiting for events.   *
-*   You can send events through the API documented at:                     *
-*    - http://docs.bigchaindb.apiary.io/                                   *
+*   Initialization complete. BigchainDB Server is ready and waiting.       *
+*   You can send HTTP requests via the HTTP API documented in the          *
+*   BigchainDB Server docs at:                                             *
+*    https://bigchaindb.com/http-api                                       *
 *                                                                          *
 *   Listening to client connections on: {:<15}                    *
 *                                                                          *
@@ -30,6 +31,9 @@ def start():
 
     logger.info('Starting voter')
     vote.start()
+
+    logger.info('Starting stale transaction monitor')
+    stale.start()
 
     logger.info('Starting election')
     election.start()

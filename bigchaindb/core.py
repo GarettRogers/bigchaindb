@@ -1,14 +1,21 @@
 import random
 import math
 import collections
-from copy import deepcopy
+from time import time
 
 from itertools import compress
+from bigchaindb.common import crypto, exceptions
+from bigchaindb.common.util import gen_timestamp, serialize
+from bigchaindb.common.transaction import TransactionLink, Metadata
+
 import rethinkdb as r
-import rapidjson
 
 import bigchaindb
-from bigchaindb import config_utils, crypto, exceptions, util
+
+from bigchaindb.db.utils import Connection
+from bigchaindb import config_utils, util
+from bigchaindb.consensus import BaseConsensusRules
+from bigchaindb.models import Block, Transaction
 
 
 class Bigchain(object):
@@ -28,7 +35,7 @@ class Bigchain(object):
 
     def __init__(self, host=None, port=None, dbname=None,
                  public_key=None, private_key=None, keyring=[],
-                 consensus_plugin=None):
+                 backlog_reassign_delay=None):
         """Initialize the Bigchain instance
 
         A Bigchain instance has several configuration parameters (e.g. host).
@@ -56,58 +63,18 @@ class Bigchain(object):
         self.me = public_key or bigchaindb.config['keypair']['public']
         self.me_private = private_key or bigchaindb.config['keypair']['private']
         self.nodes_except_me = keyring or bigchaindb.config['keyring']
-        self.consensus = config_utils.load_consensus_plugin(consensus_plugin)
+        self.backlog_reassign_delay = backlog_reassign_delay or bigchaindb.config['backlog_reassign_delay']
+        self.consensus = BaseConsensusRules
         # change RethinkDB read mode to majority.  This ensures consistency in query results
         self.read_mode = 'majority'
 
         if not self.me or not self.me_private:
             raise exceptions.KeypairNotFoundException()
 
-        self._conn = None
-
-    @property
-    def conn(self):
-        if not self._conn:
-            self._conn = self.reconnect()
-        return self._conn
+        self.connection = Connection(host=self.host, port=self.port, db=self.dbname)
 
     def reconnect(self):
         return r.connect(host=self.host, port=self.port, db=self.dbname)
-
-    def create_transaction(self, *args, **kwargs):
-        """Create a new transaction
-
-        Refer to the documentation of your consensus plugin.
-
-        Returns:
-            dict: newly constructed transaction.
-        """
-
-        return self.consensus.create_transaction(*args, **kwargs)
-
-    def sign_transaction(self, transaction, *args, **kwargs):
-        """Sign a transaction
-
-        Refer to the documentation of your consensus plugin.
-
-        Returns:
-            dict: transaction with any signatures applied.
-        """
-
-        return self.consensus.sign_transaction(transaction, *args, bigchain=self, **kwargs)
-
-    def validate_fulfillments(self, signed_transaction, *args, **kwargs):
-        """Validate the fulfillment(s) of a transaction.
-
-        Refer to the documentation of your consensus plugin.
-
-        Returns:
-            bool: True if the transaction's required fulfillments are present
-                and correct, False otherwise.
-        """
-
-        return self.consensus.validate_fulfillments(
-            signed_transaction, *args, **kwargs)
 
     def write_transaction(self, signed_transaction, durability='soft'):
         """Write the transaction to bigchain.
@@ -116,30 +83,108 @@ class Bigchain(object):
         it has been validated by the nodes of the federation.
 
         Args:
-            signed_transaction (dict): transaction with the `signature` included.
+            signed_transaction (Transaction): transaction with the `signature` included.
 
         Returns:
             dict: database response
         """
+        signed_transaction = signed_transaction.to_dict()
 
         # we will assign this transaction to `one` node. This way we make sure that there are no duplicate
         # transactions on the bigchain
-
         if self.nodes_except_me:
             assignee = random.choice(self.nodes_except_me)
         else:
             # I am the only node
             assignee = self.me
 
-        # We copy the transaction here to not add `assignee` to the transaction
-        # dictionary passed to this method (as it would update by reference).
-        signed_transaction = deepcopy(signed_transaction)
-        # update the transaction
         signed_transaction.update({'assignee': assignee})
+        signed_transaction.update({'assignment_timestamp': time()})
 
         # write to the backlog
-        response = r.table('backlog').insert(signed_transaction, durability=durability).run(self.conn)
+        response = self.connection.run(
+                r.table('backlog')
+                .insert(signed_transaction, durability=durability))
         return response
+
+    def reassign_transaction(self, transaction, durability='hard'):
+        """Assign a transaction to a new node
+
+        Args:
+            transaction (dict): assigned transaction
+
+        Returns:
+            dict: database response or None if no reassignment is possible
+        """
+
+        if self.nodes_except_me:
+            try:
+                federation_nodes = self.nodes_except_me + [self.me]
+                index_current_assignee = federation_nodes.index(transaction['assignee'])
+                new_assignee = random.choice(federation_nodes[:index_current_assignee] +
+                                             federation_nodes[index_current_assignee + 1:])
+            except ValueError:
+                # current assignee not in federation
+                new_assignee = random.choice(self.nodes_except_me)
+
+        else:
+            # There is no other node to assign to
+            new_assignee = self.me
+
+        response = self.connection.run(
+                r.table('backlog')
+                .get(transaction['id'])
+                .update({'assignee': new_assignee, 'assignment_timestamp': time()},
+                        durability=durability))
+        return response
+
+    def get_stale_transactions(self):
+        """Get a RethinkDB cursor of stale transactions
+
+        Transactions are considered stale if they have been assigned a node, but are still in the
+        backlog after some amount of time specified in the configuration
+        """
+
+        return self.connection.run(
+                r.table('backlog')
+                .filter(lambda tx: time() - tx['assignment_timestamp'] > self.backlog_reassign_delay))
+
+    def validate_transaction(self, transaction):
+        """Validate a transaction.
+
+        Args:
+            transaction (Transaction): transaction to validate.
+
+        Returns:
+            The transaction if the transaction is valid else it raises an
+            exception describing the reason why the transaction is invalid.
+        """
+
+        return self.consensus.validate_transaction(self, transaction)
+
+    def is_valid_transaction(self, transaction):
+        """Check whether a transaction is valid or invalid.
+
+        Similar to :meth:`~bigchaindb.Bigchain.validate_transaction`
+        but never raises an exception. It returns :obj:`False` if
+        the transaction is invalid.
+
+        Args:
+            transaction (:Class:`~bigchaindb.models.Transaction`): transaction
+                to check.
+
+        Returns:
+            The :class:`~bigchaindb.models.Transaction` instance if valid,
+            otherwise :obj:`False`.
+        """
+
+        try:
+            return self.validate_transaction(transaction)
+        except (ValueError, exceptions.OperationError, exceptions.TransactionDoesNotExist,
+                exceptions.TransactionOwnerError, exceptions.DoubleSpend,
+                exceptions.InvalidHash, exceptions.InvalidSignature,
+                exceptions.FulfillmentNotInValidBlock):
+            return False
 
     def get_transaction(self, txid, include_status=False):
         """Retrieve a transaction with `txid` from bigchain.
@@ -179,15 +224,24 @@ class Bigchain(object):
                         break
 
                 # Query the transaction in the target block and return
-                response = r.table('bigchain', read_mode=self.read_mode).get(target_block_id)\
-                    .get_field('block').get_field('transactions')\
-                    .filter(lambda tx: tx['id'] == txid).run(self.conn)[0]
+                response = self.connection.run(
+                        r.table('bigchain', read_mode=self.read_mode)
+                        .get(target_block_id)
+                        .get_field('block')
+                        .get_field('transactions')
+                        .filter(lambda tx: tx['id'] == txid))[0]
 
         else:
             # Otherwise, check the backlog
-            response = r.table('backlog').get(txid).run(self.conn)
+            response = self.connection.run(r.table('backlog')
+                                           .get(txid)
+                                           .without('assignee', 'assignment_timestamp')
+                                           .default(None))
             if response:
                 tx_status = self.TX_IN_BACKLOG
+
+        if response:
+            response = Transaction.from_dict(response)
 
         if include_status:
             return response, tx_status
@@ -216,11 +270,13 @@ class Bigchain(object):
             index (str): name of a secondary index, e.g. 'transaction_id'
 
         Returns:
-            A list of blocks with with only election information
+            :obj:`list` of :obj:`dict`: A list of blocks with with only election information
         """
         # First, get information on all blocks which contain this transaction
-        response = r.table('bigchain', read_mode=self.read_mode).get_all(value, index=index)\
-            .pluck('votes', 'id', {'block': ['voters']}).run(self.conn)
+        response = self.connection.run(
+                r.table('bigchain', read_mode=self.read_mode)
+                .get_all(value, index=index)
+                .pluck('votes', 'id', {'block': ['voters']}))
 
         return list(response)
 
@@ -239,68 +295,98 @@ class Bigchain(object):
 
         # First, get information on all blocks which contain this transaction
         blocks = self.search_block_election_on_index(txid, 'transaction_id')
-
         if blocks:
             # Determine the election status of each block
-            validity = {block['id']: self.block_election_status(block) for block in blocks}
+            validity = {
+                block['id']: self.block_election_status(
+                    block['id'],
+                    block['block']['voters']
+                ) for block in blocks
+            }
 
-            # If there are multiple valid blocks with this transaction, something has gone wrong
+            # NOTE: If there are multiple valid blocks with this transaction,
+            #       something has gone wrong
             if list(validity.values()).count(Bigchain.BLOCK_VALID) > 1:
                 block_ids = str([block for block in validity
-                                       if validity[block] == Bigchain.BLOCK_VALID])
-                raise Exception('Transaction {tx} is present in multiple valid blocks: {block_ids}'
-                                .format(tx=txid, block_ids=block_ids))
+                                 if validity[block] == Bigchain.BLOCK_VALID])
+                raise exceptions.DoubleSpend('Transaction {tx} is present in '
+                                             'multiple valid blocks: '
+                                             '{block_ids}'
+                                             .format(tx=txid,
+                                                     block_ids=block_ids))
 
             return validity
 
         else:
             return None
 
-    def get_tx_by_payload_uuid(self, payload_uuid):
-        """Retrieves transactions related to a digital asset.
+    def get_tx_by_metadata_id(self, metadata_id):
+        """Retrieves transactions related to a metadata.
 
-        When creating a transaction one of the optional arguments is the `payload`. The payload is a generic
-        dict that contains information about the digital asset.
+        When creating a transaction one of the optional arguments is the `metadata`. The metadata is a generic
+        dict that contains extra information that can be appended to the transaction.
 
-        To make it easy to query the bigchain for that digital asset we create a UUID for the payload and 
-        store it with the transaction. This makes it easy for developers to keep track of their digital 
-        assets in bigchain.
+        To make it easy to query the bigchain for that particular metadata we create a UUID for the metadata and
+        store it with the transaction.
 
         Args:
-            payload_uuid (str): the UUID for this particular payload.
+            metadata_id (str): the id for this particular metadata.
 
         Returns:
-            A list of transactions containing that payload. If no transaction exists with that payload it
+            A list of transactions containing that metadata. If no transaction exists with that metadata it
             returns an empty list `[]`
         """
-        cursor = r.table('bigchain', read_mode=self.read_mode) \
-            .get_all(payload_uuid, index='payload_uuid') \
-            .concat_map(lambda block: block['block']['transactions']) \
-            .filter(lambda transaction: transaction['transaction']['data']['uuid'] == payload_uuid) \
-            .run(self.conn)
+        cursor = self.connection.run(
+                r.table('bigchain', read_mode=self.read_mode)
+                .get_all(metadata_id, index='metadata_id')
+                .concat_map(lambda block: block['block']['transactions'])
+                .filter(lambda transaction: transaction['transaction']['metadata']['id'] == metadata_id))
 
         transactions = list(cursor)
-        return transactions
+        return [Transaction.from_dict(tx) for tx in transactions]
 
-    def get_spent(self, tx_input):
+    def get_txs_by_asset_id(self, asset_id):
+        """Retrieves transactions related to a particular asset.
+
+        A digital asset in bigchaindb is identified by an uuid. This allows us to query all the transactions
+        related to a particular digital asset, knowing the id.
+
+        Args:
+            asset_id (str): the id for this particular metadata.
+
+        Returns:
+            A list of transactions containing related to the asset. If no transaction exists for that asset it
+            returns an empty list `[]`
+        """
+        cursor = self.connection.run(
+            r.table('bigchain', read_mode=self.read_mode)
+             .get_all(asset_id, index='asset_id')
+             .concat_map(lambda block: block['block']['transactions'])
+             .filter(lambda transaction: transaction['transaction']['asset']['id'] == asset_id))
+
+        return [Transaction.from_dict(tx) for tx in cursor]
+
+    def get_spent(self, txid, cid):
         """Check if a `txid` was already used as an input.
 
         A transaction can be used as an input for another transaction. Bigchain needs to make sure that a
         given `txid` is only used once.
 
         Args:
-            tx_input (dict): Input of a transaction in the form `{'txid': 'transaction id', 'cid': 'condition id'}`
+            txid (str): The id of the transaction
+            cid (num): the index of the condition in the respective transaction
 
         Returns:
-            The transaction that used the `txid` as an input if it exists else it returns `None`
+            The transaction (Transaction) that used the `txid` as an input else
+            `None`
         """
         # checks if an input was already spent
         # checks if the bigchain has any transaction with input {'txid': ..., 'cid': ...}
-        response = r.table('bigchain', read_mode=self.read_mode)\
-            .concat_map(lambda doc: doc['block']['transactions'])\
-            .filter(lambda transaction: transaction['transaction']['fulfillments']
-                    .contains(lambda fulfillment: fulfillment['input'] == tx_input))\
-            .run(self.conn)
+        response = self.connection.run(
+                r.table('bigchain', read_mode=self.read_mode)
+                .concat_map(lambda doc: doc['block']['transactions'])
+                .filter(lambda transaction: transaction['transaction']['fulfillments']
+                    .contains(lambda fulfillment: fulfillment['input'] == {'txid': txid, 'cid': cid})))
 
         transactions = list(response)
 
@@ -310,14 +396,15 @@ class Bigchain(object):
             num_valid_transactions = 0
             for transaction in transactions:
                 # ignore invalid blocks
+                # FIXME: Isn't there a faster solution than doing I/O again?
                 if self.get_transaction(transaction['id']):
                     num_valid_transactions += 1
                 if num_valid_transactions > 1:
                     raise exceptions.DoubleSpend('`{}` was spent more then once. There is a problem with the chain'.format(
-                        tx_input['txid']))
+                        txid))
 
             if num_valid_transactions:
-                return transactions[0]
+                return Transaction.from_dict(transactions[0])
             else:
                 # all queried transactions were invalid
                 return None
@@ -331,16 +418,17 @@ class Bigchain(object):
             owner (str): base58 encoded public key.
 
         Returns:
-            list: list of `txids` currently owned by `owner`
+            list (TransactionLink): list of `txid`s and `cid`s pointing to
+                                      another transaction's condition
         """
 
         # get all transactions in which owner is in the `owners_after` list
-        response = r.table('bigchain', read_mode=self.read_mode) \
-            .concat_map(lambda doc: doc['block']['transactions']) \
-            .filter(lambda tx: tx['transaction']['conditions']
+        response = self.connection.run(
+                r.table('bigchain', read_mode=self.read_mode)
+                .concat_map(lambda doc: doc['block']['transactions'])
+                .filter(lambda tx: tx['transaction']['conditions']
                     .contains(lambda c: c['owners_after']
-                              .contains(owner))) \
-            .run(self.conn)
+                        .contains(owner))))
         owned = []
 
         for tx in response:
@@ -350,95 +438,49 @@ class Bigchain(object):
                 if Bigchain.BLOCK_UNDECIDED not in validity.values():
                     continue
 
+            # NOTE: It's OK to not serialize the transaction here, as we do not
+            #       use it after the execution of this function.
             # a transaction can contain multiple outputs (conditions) so we need to iterate over all of them
             # to get a list of outputs available to spend
-            for condition in tx['transaction']['conditions']:
+            for index, cond in enumerate(tx['transaction']['conditions']):
                 # for simple signature conditions there are no subfulfillments
                 # check if the owner is in the condition `owners_after`
-                if len(condition['owners_after']) == 1:
-                    if condition['condition']['details']['public_key'] == owner:
-                        tx_input = {'txid': tx['id'], 'cid': condition['cid']}
+                if len(cond['owners_after']) == 1:
+                    if cond['condition']['details']['public_key'] == owner:
+                        tx_link = TransactionLink(tx['id'], index)
                 else:
                     # for transactions with multiple `owners_after` there will be several subfulfillments nested
                     # in the condition. We need to iterate the subfulfillments to make sure there is a
                     # subfulfillment for `owner`
-                    if util.condition_details_has_owner(condition['condition']['details'], owner):
-                        tx_input = {'txid': tx['id'], 'cid': condition['cid']}
+                    if util.condition_details_has_owner(cond['condition']['details'], owner):
+                        tx_link = TransactionLink(tx['id'], index)
                 # check if input was already spent
-                if not self.get_spent(tx_input):
-                    owned.append(tx_input)
+                if not self.get_spent(tx_link.txid, tx_link.cid):
+                    owned.append(tx_link)
 
         return owned
-
-    def validate_transaction(self, transaction):
-        """Validate a transaction.
-
-        Args:
-            transaction (dict): transaction to validate.
-
-        Returns:
-            The transaction if the transaction is valid else it raises an
-            exception describing the reason why the transaction is invalid.
-        """
-
-        return self.consensus.validate_transaction(self, transaction)
-
-    def is_valid_transaction(self, transaction):
-        """Check whether a transacion is valid or invalid.
-
-        Similar to `validate_transaction` but never raises an exception.
-        It returns `False` if the transaction is invalid.
-
-        Args:
-            transaction (dict): transaction to check.
-
-        Returns:
-            `transaction` if the transaction is valid, `False` otherwise
-        """
-
-        try:
-            self.validate_transaction(transaction)
-            return transaction
-        except (ValueError, exceptions.OperationError, exceptions.TransactionDoesNotExist,
-                exceptions.TransactionOwnerError, exceptions.DoubleSpend,
-                exceptions.InvalidHash, exceptions.InvalidSignature):
-            return False
 
     def create_block(self, validated_transactions):
         """Creates a block given a list of `validated_transactions`.
 
-        Note that this method does not validate the transactions. Transactions should be validated before
-        calling create_block.
+        Note that this method does not validate the transactions. Transactions
+        should be validated before calling create_block.
 
         Args:
-            validated_transactions (list): list of validated transactions.
+            validated_transactions (list(Transaction)): list of validated
+                                                        transactions.
 
         Returns:
-            dict: created block.
+            Block: created block.
         """
-
         # Prevent the creation of empty blocks
         if len(validated_transactions) == 0:
-            raise exceptions.OperationError('Empty block creation is not allowed')
+            raise exceptions.OperationError('Empty block creation is not '
+                                            'allowed')
 
-        # Create the new block
-        block = {
-            'timestamp': util.timestamp(),
-            'transactions': validated_transactions,
-            'node_pubkey': self.me,
-            'voters': self.nodes_except_me + [self.me]
-        }
-
-        # Calculate the hash of the new block
-        block_data = util.serialize(block)
-        block_hash = crypto.hash_data(block_data)
-        block_signature = crypto.SigningKey(self.me_private).sign(block_data)
-
-        block = {
-            'id': block_hash,
-            'block': block,
-            'signature': block_signature,
-        }
+        voters = self.nodes_except_me + [self.me]
+        block = Block(validated_transactions, self.me, gen_timestamp(), voters)
+        block = block.sign(self.me_private)
 
         return block
 
@@ -447,33 +489,20 @@ class Bigchain(object):
         """Validate a block.
 
         Args:
-            block (dict): block to validate.
+            block (Block): block to validate.
 
         Returns:
             The block if the block is valid else it raises and exception
             describing the reason why the block is invalid.
         """
-        # First, make sure this node hasn't already voted on this block
-        if self.has_previous_vote(block):
-            return block
+        return self.consensus.validate_block(self, block)
 
-        # Run the plugin block validation logic
-        self.consensus.validate_block(self, block)
-
-        # Finally: Tentative assumption that every blockchain will want to
-        # validate all transactions in each block
-        for transaction in block['block']['transactions']:
-            if not self.is_valid_transaction(transaction):
-                # this will raise the exception
-                self.validate_transaction(transaction)
-
-        return block
-
-    def has_previous_vote(self, block):
+    def has_previous_vote(self, block_id, voters):
         """Check for previous votes from this node
 
         Args:
-            block (dict): block to check.
+            block_id (str): the id of the block to check
+            voters (list(str)): the voters of the block to check
 
         Returns:
             bool: :const:`True` if this block already has a
@@ -484,68 +513,55 @@ class Bigchain(object):
                 but the vote is invalid.
 
         """
-        votes = list(r.table('votes', read_mode=self.read_mode)\
-                     .get_all([block['id'], self.me], index='block_and_voter').run(self.conn))
+        votes = list(self.connection.run(
+            r.table('votes', read_mode=self.read_mode)
+            .get_all([block_id, self.me], index='block_and_voter')))
 
         if len(votes) > 1:
             raise exceptions.MultipleVotesError('Block {block_id} has {n_votes} votes from public key {me}'
-                                     .format(block_id=block['id'], n_votes=str(len(votes)), me=self.me))
+                                                .format(block_id=block_id, n_votes=str(len(votes)), me=self.me))
         has_previous_vote = False
         if votes:
-            if util.verify_vote_signature(block, votes[0]):
+            if util.verify_vote_signature(voters, votes[0]):
                 has_previous_vote = True
             else:
                 raise exceptions.ImproperVoteError('Block {block_id} already has an incorrectly signed vote '
-                                        'from public key {me}'.format(block_id=block['id'], me=self.me))
+                                                   'from public key {me}'.format(block_id=block_id, me=self.me))
 
         return has_previous_vote
-
-    def is_valid_block(self, block):
-        """Check whether a block is valid or invalid.
-
-        Similar to `validate_block` but does not raise an exception if the block is invalid.
-
-        Args:
-            block (dict): block to check.
-
-        Returns:
-            bool: `True` if the block is valid, `False` otherwise.
-        """
-
-        try:
-            self.validate_block(block)
-            return True
-        except Exception:
-            return False
 
     def write_block(self, block, durability='soft'):
         """Write a block to bigchain.
 
         Args:
-            block (dict): block to write to bigchain.
+            block (Block): block to write to bigchain.
         """
 
-        block_serialized = rapidjson.dumps(block)
-        r.table('bigchain').insert(r.json(block_serialized), durability=durability).run(self.conn)
+        self.connection.run(
+                r.table('bigchain')
+                .insert(r.json(block.to_str()), durability=durability))
 
-    # TODO: Decide if we need this method
     def transaction_exists(self, transaction_id):
-        response = r.table('bigchain', read_mode=self.read_mode)\
-            .get_all(transaction_id, index='transaction_id').run(self.conn)
-        return True if len(response.items) > 0 else False
+        response = self.connection.run(
+                r.table('bigchain', read_mode=self.read_mode)\
+                .get_all(transaction_id, index='transaction_id'))
+        return len(response.items) > 0
 
     def prepare_genesis_block(self):
         """Prepare a genesis block."""
 
-        payload = {'message': 'Hello World from the BigchainDB'}
-        transaction = self.create_transaction([self.me], [self.me], None, 'GENESIS', payload=payload)
-        transaction_signed = self.sign_transaction(transaction, self.me_private)
+        metadata = {'message': 'Hello World from the BigchainDB'}
+        transaction = Transaction.create([self.me], [self.me],
+                                         metadata=metadata)
+
+        # NOTE: The transaction model doesn't expose an API to generate a
+        #       GENESIS transaction, as this is literally the only usage.
+        transaction.operation = 'GENESIS'
+        transaction = transaction.sign([self.me_private])
 
         # create the block
-        return self.create_block([transaction_signed])
+        return self.create_block([transaction])
 
-    # TODO: Unless we prescribe the signature of create_transaction, this will
-    #       also need to be moved into the plugin API.
     def create_genesis_block(self):
         """Create the genesis block
 
@@ -558,7 +574,9 @@ class Bigchain(object):
         # 2. create the block with one transaction
         # 3. write the block to the bigchain
 
-        blocks_count = r.table('bigchain', read_mode=self.read_mode).count().run(self.conn)
+        blocks_count = self.connection.run(
+                r.table('bigchain', read_mode=self.read_mode)
+                .count())
 
         if blocks_count:
             raise exceptions.GenesisBlockAlreadyExistsError('Cannot create the Genesis block')
@@ -587,11 +605,11 @@ class Bigchain(object):
             'previous_block': previous_block_id,
             'is_block_valid': decision,
             'invalid_reason': invalid_reason,
-            'timestamp': util.timestamp()
+            'timestamp': gen_timestamp()
         }
 
-        vote_data = util.serialize(vote)
-        signature = crypto.SigningKey(self.me_private).sign(vote_data)
+        vote_data = serialize(vote)
+        signature = crypto.SigningKey(self.me_private).sign(vote_data.encode())
 
         vote_signed = {
             'node_pubkey': self.me,
@@ -604,30 +622,32 @@ class Bigchain(object):
     def write_vote(self, vote):
         """Write the vote to the database."""
 
-        r.table('votes') \
-            .insert(vote) \
-            .run(self.conn)
+        self.connection.run(
+                r.table('votes')
+                .insert(vote))
 
     def get_last_voted_block(self):
         """Returns the last block that this node voted on."""
 
         try:
             # get the latest value for the vote timestamp (over all votes)
-            max_timestamp = r.table('votes', read_mode=self.read_mode) \
-                .filter(r.row['node_pubkey'] == self.me) \
-                .max(r.row['vote']['timestamp']) \
-                .run(self.conn)['vote']['timestamp']
+            max_timestamp = self.connection.run(
+                    r.table('votes', read_mode=self.read_mode)
+                    .filter(r.row['node_pubkey'] == self.me)
+                    .max(r.row['vote']['timestamp']))['vote']['timestamp']
 
-            last_voted = list(r.table('votes', read_mode=self.read_mode) \
-                .filter(r.row['vote']['timestamp'] == max_timestamp) \
-                .filter(r.row['node_pubkey'] == self.me) \
-                .run(self.conn))
+            last_voted = list(self.connection.run(
+                r.table('votes', read_mode=self.read_mode)
+                .filter(r.row['vote']['timestamp'] == max_timestamp)
+                .filter(r.row['node_pubkey'] == self.me)))
 
         except r.ReqlNonExistenceError:
             # return last vote if last vote exists else return Genesis block
-            return list(r.table('bigchain', read_mode=self.read_mode)
-                        .filter(util.is_genesis_block)
-                        .run(self.conn))[0]
+            res = self.connection.run(
+                r.table('bigchain', read_mode=self.read_mode)
+                .filter(util.is_genesis_block))
+            block = list(res)[0]
+            return Block.from_dict(block)
 
         # Now the fun starts. Since the resolution of timestamp is a second,
         # we might have more than one vote per timestamp. If this is the case
@@ -659,46 +679,50 @@ class Bigchain(object):
             except KeyError:
                 break
 
-        res = r.table('bigchain', read_mode=self.read_mode).get(last_block_id).run(self.conn)
+        res = self.connection.run(
+                r.table('bigchain', read_mode=self.read_mode)
+                .get(last_block_id))
 
-        return res
+        return Block.from_dict(res)
 
     def get_unvoted_blocks(self):
-        """Return all the blocks that has not been voted by this node."""
+        """Return all the blocks that have not been voted on by this node.
 
-        unvoted = r.table('bigchain', read_mode=self.read_mode) \
-            .filter(lambda block: r.table('votes', read_mode=self.read_mode)
+        Returns:
+            :obj:`list` of :obj:`dict`: a list of unvoted blocks
+        """
+
+        unvoted = self.connection.run(
+                r.table('bigchain', read_mode=self.read_mode)
+                .filter(lambda block: r.table('votes', read_mode=self.read_mode)
                     .get_all([block['id'], self.me], index='block_and_voter')
-                    .is_empty()) \
-            .order_by(r.asc(r.row['block']['timestamp'])) \
-            .run(self.conn)
+                    .is_empty())
+                .order_by(r.asc(r.row['block']['timestamp'])))
 
         # FIXME: I (@vrde) don't like this solution. Filtering should be done at a
         #        database level. Solving issue #444 can help untangling the situation
-        unvoted = filter(lambda block: not util.is_genesis_block(block), unvoted)
+        unvoted_blocks = filter(lambda block: not util.is_genesis_block(block), unvoted)
+        return unvoted_blocks
 
-        return list(unvoted)
-
-    def block_election_status(self, block):
+    def block_election_status(self, block_id, voters):
         """Tally the votes on a block, and return the status: valid, invalid, or undecided."""
 
-        votes = r.table('votes', read_mode=self.read_mode) \
-            .between([block['id'], r.minval], [block['id'], r.maxval], index='block_and_voter') \
-            .run(self.conn)
+        votes = self.connection.run(r.table('votes', read_mode=self.read_mode)
+            .between([block_id, r.minval], [block_id, r.maxval], index='block_and_voter'))
 
         votes = list(votes)
 
-        n_voters = len(block['block']['voters'])
+        n_voters = len(voters)
 
         voter_counts = collections.Counter([vote['node_pubkey'] for vote in votes])
         for node in voter_counts:
             if voter_counts[node] > 1:
                 raise exceptions.MultipleVotesError('Block {block_id} has multiple votes ({n_votes}) from voting node {node_id}'
-                                                    .format(block_id=block['id'], n_votes=str(voter_counts[node]), node_id=node))
+                                                    .format(block_id=block_id, n_votes=str(voter_counts[node]), node_id=node))
 
         if len(votes) > n_voters:
             raise exceptions.MultipleVotesError('Block {block_id} has {n_votes} votes cast, but only {n_voters} voters'
-                                                .format(block_id=block['id'], n_votes=str(len(votes)), n_voters=str(n_voters)))
+                                                .format(block_id=block_id, n_votes=str(len(votes)), n_voters=str(n_voters)))
 
         # vote_cast is the list of votes e.g. [True, True, False]
         vote_cast = [vote['vote']['is_block_valid'] for vote in votes]
@@ -707,7 +731,7 @@ class Bigchain(object):
         prev_block = [vote['vote']['previous_block'] for vote in votes]
         # vote_validity checks whether a vote is valid
         # or invalid, e.g. [False, True, True]
-        vote_validity = [self.consensus.verify_vote_signature(block, vote) for vote in votes]
+        vote_validity = [self.consensus.verify_vote_signature(voters, vote) for vote in votes]
 
         # element-wise product of stated vote and validity of vote
         # vote_cast = [True, True, False] and
